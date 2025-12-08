@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 import numpy as np
 import uvicorn
 import base64
@@ -13,37 +13,25 @@ import io
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from matplotlib.patches import Patch
-
-# Optional smoothing for cleaner shapes
+from matplotlib.colors import ListedColormap, BoundaryNorm
 from scipy.ndimage import binary_opening, binary_closing
 
 # Local imports
-from models.unet_inference import BurnScarUNetInference
-from models.burn_scar_inference import BurnScarInference, SentinelHubAPI
+from model.unet_inference import BurnScarUNetInference
+from model.burn_scar_inference import BurnScarInference, SentinelHubAPI
 
-
+# Helper for matplotlib images
 def fig_to_base64(fig):
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor='#0f172a') # Dark bg match
     plt.close(fig)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("utf-8")
 
-
-# ============================================================
-#  PATHS & INITIALIZATION
-# ============================================================
-
 BASE_DIR = Path(__file__).parent.parent
-WEIGHTS_PATH = BASE_DIR / "models" / "best_unet_burn_scar.pth"
+WEIGHTS_PATH = BASE_DIR / "model" / "best_unet_burn_scar.pth"
 
-app = FastAPI(
-    title="Burn Scar Detection API",
-    description="Bounding box + Sentinel-2 + U-Net",
-    version="2.0.0",
-)
+app = FastAPI(title="Burn Scar Analytics API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,24 +40,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Engines
-file_inference_engine = BurnScarUNetInference(str(WEIGHTS_PATH))
+# Initialize engines
 bbox_inference_engine = BurnScarInference(str(WEIGHTS_PATH))
 sentinel_api = SentinelHubAPI()
 
-
-# ============================================================
-#  MODELS / SCHEMAS
-# ============================================================
-
-class PredictionSummary(BaseModel):
-    burned_fraction: float
-    burned_pixels: int
-    total_pixels: int
-    height: int
-    width: int
-
-
+# --- Request Models ---
 class BBoxRequest(BaseModel):
     min_lon: float
     min_lat: float
@@ -78,157 +53,130 @@ class BBoxRequest(BaseModel):
     date_from: str
     date_to: str
 
-
-# ============================================================
-# FILE UPLOAD ENDPOINT (unchanged)
-# ============================================================
-
-@app.post("/predict")
-async def predict(file: UploadFile = File(...), return_mask_png: bool = False):
-    if not file.filename.lower().endswith(".tif"):
-        raise HTTPException(400, "Please upload a .tif GeoTIFF")
-
-    tif_bytes = await file.read()
-    try:
-        mask, prob_map = file_inference_engine.predict_mask(tif_bytes)
-    except Exception as e:
-        raise HTTPException(500, f"Inference failed: {e}")
-
-    h, w = mask.shape
-    total = mask.size
-    burned = int(np.sum(mask == 1))
-
-    summary = PredictionSummary(
-        burned_fraction=burned / total,
-        burned_pixels=burned,
-        total_pixels=total,
-        height=h,
-        width=w,
-    )
-
-    if not return_mask_png:
-        return JSONResponse(content=summary.dict())
-
-    png_bytes = file_inference_engine.mask_to_png_bytes(mask)
-    return Response(content=png_bytes, media_type="image/png")
-
-
-# ============================================================
-# NEW ENDPOINT: BBOX + SENTINEL + 4 IMAGES
-# ============================================================
+# --- Endpoints ---
 
 @app.post("/predict_with_bbox")
 async def predict_with_bbox(req: BBoxRequest):
-
     bbox = [req.min_lon, req.min_lat, req.max_lon, req.max_lat]
 
-    # 1. Download Sentinel-2 imagery
+    # 1. Download Sentinel-2 imagery (12 bands)
     try:
         bands = sentinel_api.download_imagery(
-            bbox=bbox,
-            date_from=req.date_from,
-            date_to=req.date_to,
-            max_cloud_cover=40
+            bbox=bbox, date_from=req.date_from, date_to=req.date_to, max_cloud_cover=30
         )
     except Exception as e:
-        raise HTTPException(500, f"Sentinel download failed: {e}")
+        raise HTTPException(500, f"Sentinel Hub Error: {str(e)}")
 
-    # 2. Run U-Net inference
-    try:
-        prediction, confidence = bbox_inference_engine.predict(bands)
-    except Exception as e:
-        raise HTTPException(500, f"Inference failed: {e}")
+    # 2. Run AI Inference
+    # prediction (0 or 1), confidence (0.0 to 1.0)
+    prediction, confidence = bbox_inference_engine.predict(bands)
 
+    # 3. Post-processing
     h, w = prediction.shape
-    total = prediction.size
+    total_pixels = prediction.size
+    
+    # Clean up prediction with morphological operations
+    burn_mask = (prediction == 1) & (confidence > 0.85)
+    burn_mask = binary_opening(burn_mask, structure=np.ones((2, 2)))
+    burn_mask = binary_closing(burn_mask, structure=np.ones((2, 2)))
+    
+    burned_pixels = int(np.sum(burn_mask))
 
     # =======================================================
-    # CONFIDENCE-THRESHOLDED BURN MASK (used everywhere)
+    # NEW FEATURE: BURN SEVERITY ANALYSIS (NBR)
     # =======================================================
-    THRESHOLD = 0.97
-
-    # high-confidence burned pixels
-    burn_mask = (prediction == 1) & (confidence > THRESHOLD)
-
-    # smooth the mask a bit
-    burn_mask = binary_opening(burn_mask, structure=np.ones((3, 3)))
-    burn_mask = binary_closing(burn_mask, structure=np.ones((3, 3)))
-
-    burned = int(np.sum(burn_mask))
-    burned_fraction = burned / total if total > 0 else 0.0
-
-    avg_conf = float(np.mean(confidence))
-    burned_conf = float(np.mean(confidence[burn_mask])) if burned > 0 else 0.0
+    # NBR = (NIR - SWIR) / (NIR + SWIR)
+    # Band indices from SentinelHubAPI: B02(0), B03(1), B04(2), B08(3-NIR), B11(4-SWIR1), B12(5)
+    nir = bands[3]
+    swir = bands[4]
+    
+    # Calculate NBR
+    with np.errstate(divide='ignore', invalid='ignore'):
+        nbr = (nir - swir) / (nir + swir + 1e-8)
+    
+    # Classify Severity only within the burned area
+    # -1 to 0.1: High Severity (typically post-fire low values)
+    # 0.1 to 0.27: Moderate
+    # > 0.27: Low Severity / Regrowth
+    # Note: These thresholds are approximations for demo purposes
+    
+    severity_map = np.zeros_like(nbr)
+    severity_map[:] = np.nan # Background
+    
+    # We only care about severity inside the predicted burn mask
+    mask_indices = np.where(burn_mask == 1)
+    
+    # Create empty counts
+    sev_counts = {"high": 0, "moderate": 0, "low": 0}
+    
+    if burned_pixels > 0:
+        burned_nbr = nbr[mask_indices]
+        
+        # 3 = High, 2 = Moderate, 1 = Low
+        sev_class = np.zeros_like(burned_nbr)
+        sev_class[burned_nbr < 0.1] = 3      # High
+        sev_class[(burned_nbr >= 0.1) & (burned_nbr < 0.27)] = 2 # Moderate
+        sev_class[burned_nbr >= 0.27] = 1    # Low
+        
+        # Map back to 2D array for visualization
+        severity_map[mask_indices] = sev_class
+        
+        # Calculate stats
+        sev_counts["high"] = float(np.sum(sev_class == 3) / burned_pixels)
+        sev_counts["moderate"] = float(np.sum(sev_class == 2) / burned_pixels)
+        sev_counts["low"] = float(np.sum(sev_class == 1) / burned_pixels)
 
     # =======================================================
-    # --- RGB IMAGE ---
+    # VISUALIZATION GENERATION
     # =======================================================
+    
+    # 1. RGB Image
     rgb = np.stack([bands[2], bands[1], bands[0]], axis=-1)
-    rgb_vis = np.zeros_like(rgb)
-    for i in range(3):
-        p2, p98 = np.percentile(rgb[:, :, i], (2, 98))
-        rgb_vis[:, :, i] = np.clip((rgb[:, :, i] - p2) / (p98 - p2 + 1e-8), 0, 1)
-
-    fig1 = plt.figure(figsize=(6, 6))
+    # Brighten it up slightly
+    rgb_vis = np.clip(rgb * 2.5, 0, 1) 
+    
+    fig_rgb = plt.figure(figsize=(5, 5))
     plt.imshow(rgb_vis)
-    plt.title("Satellite Imagery (RGB)", fontsize=14)
-    plt.axis("off")
-    rgb_b64 = fig_to_base64(fig1)
+    plt.axis('off')
+    rgb_b64 = fig_to_base64(fig_rgb)
 
-    # =======================================================
-    # --- OVERLAY (uses burn_mask) ---
-    # =======================================================
-    fig2 = plt.figure(figsize=(6, 6))
+    # 2. Overlay (Red on RGB)
+    fig_overlay = plt.figure(figsize=(5, 5))
     plt.imshow(rgb_vis)
-
-    overlay = np.zeros((*burn_mask.shape, 4))
-    overlay[:, :, 0] = 1.0               # red
-    overlay[:, :, 3] = burn_mask * 0.55  # alpha only where confident burned
-
+    overlay = np.zeros((h, w, 4))
+    overlay[burn_mask == 1] = [1, 0, 0, 0.4] # Red, semi-transparent
     plt.imshow(overlay)
-    plt.title(f"Burn Scar Overlay (conf > {THRESHOLD})", fontsize=14)
-    plt.axis("off")
-    overlay_b64 = fig_to_base64(fig2)
+    plt.axis('off')
+    overlay_b64 = fig_to_base64(fig_overlay)
 
-    # =======================================================
-    # --- BURN SCAR MASK (also uses burn_mask) ---
-    # =======================================================
-    fig3 = plt.figure(figsize=(6, 6))
-    cmap_mask = ListedColormap(["lightgray", "darkred"])
-    # burn_mask is boolean; imshow handles it fine as 0/1
-    plt.imshow(burn_mask, cmap=cmap_mask, vmin=0, vmax=1)
-    plt.title(f"Burn Scar Mask (conf > {THRESHOLD})", fontsize=14)
-    plt.axis("off")
-    mask_b64 = fig_to_base64(fig3)
-
-    # =======================================================
-    # --- CONFIDENCE MAP (same as before) ---
-    # =======================================================
-    fig4 = plt.figure(figsize=(6, 6))
-    im = plt.imshow(confidence, cmap="YlOrRd", vmin=0, vmax=1)
-    plt.title("Model Confidence", fontsize=14)
-    plt.axis("off")
-    plt.colorbar(im, fraction=0.046, pad=0.02)
-    confidence_b64 = fig_to_base64(fig4)
-
-    # =======================================================
+    # 3. Severity Map
+    fig_sev = plt.figure(figsize=(5, 5))
+    # Custom colormap: Transparent(0), Yellow(Low), Orange(Mod), DarkRed(High)
+    colors = ['#00000000', '#fde047', '#f97316', '#7f1d1d'] # Transparent, Yellow, Orange, Red
+    cmap_sev = ListedColormap(colors)
+    
+    # Plot background (black/dark)
+    plt.imshow(np.zeros_like(burn_mask), cmap='gray', vmin=0, vmax=1)
+    
+    # Plot severity
+    # We need to handle NaNs or 0s. 
+    # Let's make a display map where 0=Background, 1=Low, 2=Mod, 3=High
+    display_map = np.zeros_like(nbr)
+    display_map[mask_indices] = severity_map[mask_indices]
+    
+    plt.imshow(display_map, cmap=cmap_sev, vmin=0, vmax=3, interpolation='nearest')
+    plt.axis('off')
+    # Add a custom legend manually if needed, or just let the UI handle it
+    severity_b64 = fig_to_base64(fig_sev)
 
     return {
-        "burned_fraction": burned_fraction,
-        "burned_pixels": burned,
-        "total_pixels": total,
-        "height": h,
-        "width": w,
-        "average_confidence": avg_conf,
-        "burned_area_confidence": burned_conf,
+        "burned_pixels": burned_pixels,
+        "total_pixels": total_pixels,
+        "severity_breakdown": sev_counts,
         "rgb_base64": rgb_b64,
         "overlay_base64": overlay_b64,
-        "mask_base64": mask_b64,
-        "confidence_base64": confidence_b64,
+        "severity_base64": severity_b64
     }
-
-
-# ============================================================
 
 if __name__ == "__main__":
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
