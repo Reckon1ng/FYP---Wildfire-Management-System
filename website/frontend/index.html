@@ -71,6 +71,13 @@
         </div>
     </div>
     
+    <div class="control-group">
+        <label>Preset Fires</label>
+        <select id="presetSelect" style="width:100%; padding:0.5rem; background:#334155; color:white; border-radius:0.25rem; border:1px solid #475569;">
+            <option value="">-- Select a preset fire --</option>
+        </select>
+    </div>
+    
     <input type="hidden" id="minLon"><input type="hidden" id="minLat">
     <input type="hidden" id="maxLon"><input type="hidden" id="maxLat">
 
@@ -143,6 +150,27 @@
 <script>
     const API_BASE = "http://localhost:8000";
 
+    const PRESET_FIRES = [
+        {
+        "name": "Glass Fire 2020 (California)",
+        "bbox": [-122.58, 38.54, -122.50, 38.62],
+        "date_from": "2020-10-10",
+        "date_to": "2020-10-20"
+    },
+    {
+        "name": "Creek Fire 2020 (California)",
+        "bbox": [-119.35, 37.05, -119.25, 37.15],
+        "date_from": "2020-10-01",
+        "date_to": "2020-10-31"
+    },
+    {
+    "name": "January 2025 LA Fires (Palisades/Eaton Complex)",
+    "bbox": [-118.65, 34.00, -118.35, 34.20],  // West LA / Palisades–SF Valley interface
+    "date_from": "2024-12-04",
+    "date_to": "2025-01-05"
+    }
+    ];
+
     const map = L.map('map').setView([20.88, -156.68], 11); // Maui Default
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
         attribution: '© OpenStreetMap contributors'
@@ -160,6 +188,40 @@
         drawnItems.clearLayers();
         drawnItems.addLayer(e.layer);
         updateCoords(e.layer.getBounds());
+    });
+
+    // Populate preset select and wire up change handler
+    window.addEventListener('load', () => {
+        const sel = document.getElementById('presetSelect');
+        PRESET_FIRES.forEach((f, i) => {
+            const opt = document.createElement('option');
+            opt.value = String(i);
+            opt.innerText = f.name;
+            sel.appendChild(opt);
+        });
+
+        sel.addEventListener('change', async () => {
+            if (!sel.value) return;
+            const idx = parseInt(sel.value);
+            const f = PRESET_FIRES[idx];
+
+            // Set date inputs
+            document.getElementById('dateFrom').value = f.date_from;
+            document.getElementById('dateTo').value = f.date_to;
+
+            // Convert bbox [minLon, minLat, maxLon, maxLat] to Leaflet bounds [[minLat,minLon],[maxLat,maxLon]]
+            const bounds = [[f.bbox[1], f.bbox[0]], [f.bbox[3], f.bbox[2]]];
+
+            // Draw rectangle on map and update hidden inputs
+            drawnItems.clearLayers();
+            const rect = L.rectangle(bounds, { color: '#ef4444' });
+            drawnItems.addLayer(rect);
+            map.fitBounds(bounds);
+            updateCoords(rect.getBounds());
+
+            // Run analysis automatically
+            await runAnalysis();
+        });
     });
 
     function updateCoords(bounds) {

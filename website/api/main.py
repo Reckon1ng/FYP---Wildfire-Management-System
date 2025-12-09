@@ -26,9 +26,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from scipy.ndimage import binary_opening, binary_closing, label
+import rasterio.features
+from rasterio.transform import from_bounds
 
 # Local imports
-from models.burn_scar_inference import BurnScarInference, SentinelHubAPI
+from model.burn_scar_inference import BurnScarInference, SentinelHubAPI
 
 def fig_to_base64(fig):
     buf = io.BytesIO()
@@ -38,7 +40,7 @@ def fig_to_base64(fig):
     return base64.b64encode(buf.read()).decode("utf-8")
 
 BASE_DIR = Path(__file__).parent.parent
-WEIGHTS_PATH = BASE_DIR / "models" / "best_unet_burn_scar.pth"
+WEIGHTS_PATH = BASE_DIR / "model" / "best_unet_burn_scar.pth"
 
 app = FastAPI(title="Burn Scar Analytics API")
 
@@ -91,7 +93,7 @@ def check_infrastructure(bbox, burn_mask):
     """Queries OSM for buildings/roads and checks overlap with burn mask"""
     min_lon, min_lat, max_lon, max_lat = bbox
     
-    # Overpass API Query (timeout 25s)
+    # Overpass API Query (get ways + nodes so we can reconstruct full geometry)
     overpass_url = "http://overpass-api.de/api/interpreter"
     overpass_query = f"""
     [out:json][timeout:25];
@@ -99,48 +101,68 @@ def check_infrastructure(bbox, burn_mask):
       way["building"]({min_lat},{min_lon},{max_lat},{max_lon});
       way["highway"]({min_lat},{min_lon},{max_lat},{max_lon});
     );
-    out center;
+    (._;>;);
+    out body;
     """
-    
+
     try:
         response = requests.get(overpass_url, params={'data': overpass_query}, timeout=30)
         data = response.json()
-    except:
+    except Exception:
         return {"buildings_risk": 0, "roads_risk": 0, "status": "OSM Timeout"}
+
+    elements = data.get("elements", [])
+    # Build node lookup
+    nodes = {el['id']: (el['lon'], el['lat']) for el in elements if el.get('type') == 'node'}
+
+    building_geoms = []
+    road_geoms = []
+
+    for el in elements:
+        if el.get('type') != 'way':
+            continue
+        tags = el.get('tags', {}) or {}
+        node_ids = el.get('nodes', [])
+        coords = [nodes[nid] for nid in node_ids if nid in nodes]
+        if not coords:
+            continue
+
+        if 'building' in tags:
+            # Ensure polygon closed
+            if coords[0] != coords[-1]:
+                coords.append(coords[0])
+            geom = {"type": "Polygon", "coordinates": [coords]}
+            building_geoms.append(geom)
+        elif 'highway' in tags:
+            geom = {"type": "LineString", "coordinates": coords}
+            road_geoms.append(geom)
 
     buildings_hit = 0
     roads_hit = 0
-    
+
     h, w = burn_mask.shape
-    
-    for element in data.get("elements", []):
-        # Get center coordinates
-        if 'center' in element:
-            lat = element['center']['lat']
-            lon = element['center']['lon']
-        elif 'lat' in element:
-             lat = element['lat']
-             lon = element['lon']
-        else:
-            continue
+    transform = from_bounds(min_lon, min_lat, max_lon, max_lat, w, h)
 
-        # Map Lat/Lon to Pixel Coordinates
-        # X = (lon - min_lon) / (max_lon - min_lon) * w
-        # Y = (max_lat - lat) / (max_lat - min_lat) * h  <-- Inverted Y
-        
-        px = int((lon - min_lon) / (max_lon - min_lon) * w)
-        py = int((max_lat - lat) / (max_lat - min_lat) * h)
-        
-        # Check bounds
-        if 0 <= px < w and 0 <= py < h:
-            # Check if this pixel is burned
-            if burn_mask[py, px] == 1:
-                if "building" in element.get("tags", {}):
-                    buildings_hit += 1
-                elif "highway" in element.get("tags", {}):
-                    roads_hit += 1
+    try:
+        # Rasterize and test overlap per feature
+        for geom in building_geoms:
+            rast = rasterio.features.rasterize(
+                [(geom, 1)], out_shape=(h, w), transform=transform, all_touched=True, dtype='uint8'
+            )
+            if np.any((rast == 1) & (burn_mask == 1)):
+                buildings_hit += 1
 
-    return {"buildings_risk": buildings_hit, "roads_risk": roads_hit, "status": "ok"}
+        for geom in road_geoms:
+            rast = rasterio.features.rasterize(
+                [(geom, 1)], out_shape=(h, w), transform=transform, all_touched=True, dtype='uint8'
+            )
+            if np.any((rast == 1) & (burn_mask == 1)):
+                roads_hit += 1
+
+        return {"buildings_risk": buildings_hit, "roads_risk": roads_hit, "status": "ok"}
+    except Exception:
+        # Fallback to zeroes to keep API stable
+        return {"buildings_risk": 0, "roads_risk": 0, "status": "Rasterization Error"}
 
 # -----------------------------------------------------------
 # HELPER: Pre-Fire Image Fetcher
@@ -200,7 +222,7 @@ async def predict_with_bbox(req: BBoxRequest):
         raise HTTPException(500, f"Sentinel Hub Error: {str(e)}")
 
     if bands is None or bands.size == 0 or np.max(bands) == 0:
-        raise HTTPException(status_code=404, detail="No satellite data found.")
+        raise HTTPException(status_code=404, detail="No satellite data found. This may be due to: 1) Sentinel Hub credentials invalid, 2) No imagery available for this region/date range, 3) API request failed. Check server logs for details.")
 
     # 2. Inference
     prediction, confidence = bbox_inference_engine.predict(bands)
